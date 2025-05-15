@@ -14,7 +14,14 @@ import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 from torch.distributions.categorical import Categorical
+from tools.my_wrapper import MountainCarHerWrapper
 
+from stable_baselines3.her import HerReplayBuffer
+from stable_baselines3.common.vec_env import DummyVecEnv
+
+from dataclasses import dataclass, field # 导入 field
+import pathlib # 用于路径操作
+from gymnasium.wrappers import TimeLimit
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
@@ -35,13 +42,13 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
-    env_id: str = "LunarLander-v3"
+    env_id: str = "MountainCar-v0"
     """the environment id of the task"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
     num_envs: int = 8
     """the number of parallel game environments"""
-    buffer_size: int = int(1e6)
+    buffer_size: int = int(5e6)
     """the replay memory buffer size"""
     gamma: float = 0.99
     """the discount factor gamma"""
@@ -49,7 +56,7 @@ class Args:
     """target smoothing coefficient (default: 0.005)"""
     batch_size: int = 256
     """the batch size of sample from the reply memory"""
-    learning_starts: int = 5e3
+    learning_starts: int = 6e3
     """timestep to start learning"""
     policy_lr: float = 3e-4
     """the learning rate of the policy network optimizer"""
@@ -59,21 +66,29 @@ class Args:
     """the frequency of training policy (delayed)"""
     target_network_frequency: int = 2  # Denis Yarats' implementation delays this by 2.
     """the frequency of updates for the target nerworks"""
-    alpha: float = 0.2
+    alpha: float = 0.4
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
+
+    save_frequency: int =1000
+
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
         if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="human")
+            env = gym.make(env_id)
+            #env = gym.make(env_id, render_mode="human")
             #print(env.spec.max_episode_steps)
             #env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+            #print(f"Max episode steps for {args.env_id}: {env.spec.max_episode_steps if env.spec else 'N/A'}")
+
         else:
             env = gym.make(env_id)
+        env = TimeLimit(env, max_episode_steps=300)
         env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = MountainCarHerWrapper(env)
         env.action_space.seed(seed)
         return env
 
@@ -85,22 +100,40 @@ def layer_init(layer, bias_const=0.0):
     return layer
 # ALGO LOGIC: initialize agent here:
 class SoftQNetwork(nn.Module):
-    def __init__(self, env):
+    def __init__(self, env): # env 是你的环境实例
         super().__init__()
-        self.fc1 = nn.Linear(
-            np.array(env.single_observation_space.shape).prod(),#计算 NumPy 数组中所有元素的乘积。这有效地将多维观察空间的形状“展平”为一个单一的数值，代表了观察向量中元素总数。
-            256,
-        )
+        # 从字典观察空间中获取 'observation' 和 'desired_goal' 的维度
+        obs_space_orig = env.observation_space.spaces["observation"]
+        obs_dim_orig = np.array(obs_space_orig.shape).prod()
+
+        goal_space = env.observation_space.spaces["desired_goal"]
+        goal_dim = np.array(goal_space.shape).prod()
+
+        # Critic 的输入维度是 原始观察维度 + 目标维度
+        input_dim = obs_dim_orig + goal_dim
+
+        self.fc1 = nn.Linear(input_dim, 256)
         self.fc2 = nn.Linear(256, 256)
         self.fc3 = nn.Linear(256, 128)
-        self.fc_q = layer_init(nn.Linear(128, envs.single_action_space.n))
+        # 输出层输出每个离散动作的 Q 值
+        self.fc_q = layer_init(nn.Linear(128, env.action_space.n))
 
-    def forward(self, x):
-        #x = torch.cat([x, a], 1)
-        x = F.relu(self.fc1(x))
+    def forward(self, observation_dict): # 输入现在是一个字典
+        obs_features = observation_dict["observation"]
+        desired_goal_features = observation_dict["desired_goal"]
+
+        # 确保特征是扁平的 (如果它们是多维的，例如图像，你需要先展平)
+        # 假设这里已经是 (batch_size, feature_dim)
+        # obs_features = obs_features.view(obs_features.size(0), -1) # 如果需要展平
+        # desired_goal_features = desired_goal_features.view(desired_goal_features.size(0), -1)
+
+        # 将观察特征和目标特征拼接起来
+        combined_input = torch.cat([obs_features, desired_goal_features], dim=1)
+
+        x = F.relu(self.fc1(combined_input))
         x = F.relu(self.fc2(x))
         x = F.relu(self.fc3(x))
-        q_vals = self.fc_q(x)
+        q_vals = self.fc_q(x) # 输出 (batch_size, num_actions)
         return q_vals
 
 
@@ -109,28 +142,85 @@ LOG_STD_MIN = -5
 
 
 class Actor(nn.Module):
-    def __init__(self, env):
+    def __init__(self, env): # env 是你的环境实例
         super().__init__()
-        self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 256)
+        # 从字典观察空间中获取 'observation' 和 'desired_goal' 的维度
+        obs_space_orig = env.observation_space.spaces["observation"]
+        obs_dim_orig = np.array(obs_space_orig.shape).prod()
+
+        goal_space = env.observation_space.spaces["desired_goal"]
+        goal_dim = np.array(goal_space.shape).prod()
+
+        # Actor 的输入维度是 原始观察维度 + 目标维度
+        input_dim = obs_dim_orig + goal_dim
+
+        self.fc1 = nn.Linear(input_dim, 256)
         self.fc2 = nn.Linear(256, 256)
-        self.fc_logits = layer_init(nn.Linear(256, envs.single_action_space.n))
+        # 输出层输出每个离散动作的 logits
+        self.fc_logits = layer_init(nn.Linear(256, env.action_space.n))
 
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
+    def forward(self, observation_dict): # 输入现在是一个字典
+        obs_features = observation_dict["observation"]
+        obs_features = torch.Tensor(obs_features).to(device)
+        desired_goal_features = observation_dict["desired_goal"]
+        desired_goal_features=torch.Tensor(desired_goal_features).to(device)
+
+        # 确保特征是扁平的
+        # obs_features = obs_features.view(obs_features.size(0), -1)
+        # desired_goal_features = desired_goal_features.view(desired_goal_features.size(0), -1)
+
+        combined_input = torch.cat([obs_features, desired_goal_features], dim=1)
+
+        x = F.relu(self.fc1(combined_input))
         x = F.relu(self.fc2(x))
-        logits = self.fc_logits(x)
-
+        logits = self.fc_logits(x) # 输出 (batch_size, num_actions)
         return logits
 
-    def get_action(self, x):
-        logits = self(x)
-        policy_dist = Categorical(logits=logits)#通过将 logits 传递给 Categorical 的构造函数，我们创建了一个或一批（如果 batch_size > 1）分类分布对象。
-        action = policy_dist.sample()#这个方法会根据由 logits 定义的概率分布随机采样一个动作。
-        # Action probabilities for calculating the adapted soft-Q loss
+    def get_action(self, observation_dict): # 输入现在是一个字典
+        # 注意：如果你的原始观察是图像并且需要归一化 (如 x / 255.0)
+        # 你需要在这里或者 forward 方法内部处理 observation_dict["observation"]
+        # 例如:
+        # processed_obs_dict = observation_dict.copy() # 或者更深拷贝
+        # processed_obs_dict["observation"] = processed_obs_dict["observation"] / 255.0
+        # logits = self(processed_obs_dict)
+        # 或者在 forward 方法内部:
+        # obs_features = observation_dict["observation"] / 255.0 (如果适用)
+        obs_tensor_dict = {}
+        for key, value in observation_dict.items():
+            # 如果是向量化环境 (num_envs > 1)，obs[key] 已经是 NumPy 数组了
+            # 如果是单个环境，obs[key] 也应该是 NumPy 数组
+            # 你可能需要确保 value 的形状是正确的 (例如，如果 batch_size=1 但没有批次维度)
+            # 对于从 env.reset() 或 env.step() 直接获取的 obs，通常形状是正确的
+            # (n_envs, ...feature_dims...) or (...feature_dims...) for single env
+            obs_tensor_dict[key] = torch.Tensor(value).to(device)
+        logits = self(obs_tensor_dict) # 调用修改后的 forward 方法
+        policy_dist = Categorical(logits=logits)
+        action = policy_dist.sample()
         action_probs = policy_dist.probs
-        log_prob = F.log_softmax(logits, dim=1)
+        log_prob = F.log_softmax(logits, dim=1) # 所有动作的log_softmax
+        # 如果需要特定动作的 log_prob，可以在损失计算时 gather，或者这里直接用 policy_dist.log_prob(action)
         return action, log_prob, action_probs
 
+def save_checkpoint(args: Args, global_step: int, actor: Actor, qf1: SoftQNetwork, qf2: SoftQNetwork,
+                    qf1_target: SoftQNetwork, qf2_target: SoftQNetwork, run_name: str):
+    """保存模型检查点和回放缓冲区"""
+    save_dir = pathlib.Path(f"models/{run_name}")
+    save_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = save_dir / f"checkpoint_{global_step}.pt"
+    buffer_path = save_dir / f"replay_buffer_{global_step}.pkl"
+
+    checkpoint = {
+        "global_step": global_step,
+        "actor_state_dict": actor.state_dict(),
+        "qf1_state_dict": qf1.state_dict(),
+        "qf2_state_dict": qf2.state_dict(),
+        "qf1_target_state_dict": qf1_target.state_dict(),
+        "qf2_target_state_dict": qf2_target.state_dict(),
+        "args": args, # 保存超参数
+    }
+
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Checkpoint saved to {checkpoint_path}")
 
 if __name__ == "__main__":
     import stable_baselines3 as sb3
@@ -171,9 +261,11 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
-    envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
-    )
+    # envs = gym.vector.SyncVectorEnv(
+    #     [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
+    # )
+    envs = [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
+    envs = DummyVecEnv(envs)
     #assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
 
@@ -189,37 +281,46 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
     # Automatic entropy tuning
     if args.autotune:
-        target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
+        target_entropy = -torch.prod(torch.Tensor(envs.action_space.shape).to(device)).item()
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha = log_alpha.exp().item()
         a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
     else:
         alpha = args.alpha
 
-    envs.single_observation_space.dtype = np.float32
-    rb = ReplayBuffer(
-        args.buffer_size,
-        envs.single_observation_space,
-        envs.single_action_space,
-        device,
+    envs.observation_space.dtype = np.float32
+    rb = HerReplayBuffer(
+        buffer_size=args.buffer_size,
+        observation_space=envs.observation_space,
+        action_space=envs.action_space,
+        device=device,
+        env=envs,
         n_envs=args.num_envs,
         handle_timeout_termination=False,
     )
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
-    obs, _ = envs.reset(seed=args.seed)
+    obs= envs.reset()
     autoreset = np.zeros(envs.num_envs)
+    actions=np.array([envs.action_space.sample() for _ in range(envs.num_envs)])
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
-            actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
+            if global_step %6==0:
+                actions = np.array([envs.action_space.sample() for _ in range(envs.num_envs)])
         else:
-            actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
-            actions = actions.detach().cpu().numpy()
-
+            if global_step %6==0:
+                    actions, _, _ = actor.get_action(obs)
+                    actions = actions.detach().cpu().numpy()
         # TRY NOT TO MODIFY: execute the game and log data.
-        next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+        #next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+        next_obs, rewards, dones, infos = envs.step(actions)
+        # if True in dones:#打印环境返回的信息
+        #     print(infos)
+        #     breakpoint()
+        # else:
+        #     print(rewards)
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         # if "episode" in infos:
         #     for info in infos["final_info"]:
@@ -229,13 +330,13 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         #             writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
         #             break
               
-        if "_episode" in infos:
+        if "episode" in infos:
             # 获取回报、长度和时间的数组
             returns = infos["episode"]["r"]
             lengths = infos["episode"]["l"]
             times = infos["episode"]["t"]
             # 获取哪些是有效的结束标志
-            finished_mask = infos["_episode"] # 或者 infos["episode"]["_r"] 等
+            finished_mask = infos["episode"] # 或者 infos["episode"]["_r"] 等
 
             for i in np.where(finished_mask)[0]: # 遍历所有结束了的子环境的索引
                 if i==0:
@@ -248,21 +349,23 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
         empty_idx=[]
-        for idx, trunc in enumerate(truncations):
-            if not autoreset[idx]:
-                empty_idx.append(idx)
-            else:
-                if len(empty_idx)>0:
-                    new_idx=random.choice(empty_idx)
-                    real_next_obs[idx] = real_next_obs[new_idx]
-                    obs[idx] = obs[new_idx]
-                    actions[idx]=actions[new_idx]
-                    rewards[idx]=rewards[new_idx]
-                    terminations[idx]=terminations[new_idx]
-        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
+        # for idx, trunc in enumerate(truncations):
+        #     if not autoreset[idx]:
+        #         empty_idx.append(idx)
+        #     else:
+        #         if len(empty_idx)>0:
+        #             new_idx=random.choice(empty_idx)
+        #             real_next_obs[idx] = real_next_obs[new_idx]
+        #             obs[idx] = obs[new_idx]
+        #             actions[idx]=actions[new_idx]
+        #             rewards[idx]=rewards[new_idx]
+        #             terminations[idx]=terminations[new_idx]
+
+        rb.add(obs, real_next_obs, actions, rewards, autoreset, infos)
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
-        autoreset = np.logical_or(terminations, truncations)
+        autoreset = dones
+
         # for idx, trunc in enumerate(truncations):#调试
         #     if autoreset[idx]:
         #         print(infos)
@@ -299,6 +402,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     args.policy_frequency
                 ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
                     _, log_pi, action_probs = actor.get_action(data.observations)
+                    print('action probability',action_probs)
                     with torch.no_grad():
                         qf1_pi = qf1(data.observations)
                         qf2_pi = qf2(data.observations)
@@ -332,6 +436,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
+                writer.add_scalar("losses/actor_entropy_loss", (action_probs * (alpha * log_pi)).mean().item(), global_step)
+                writer.add_scalar("losses/actor_value_loss", (-1*action_probs* min_qf_values).mean().item(), global_step)
+
                 print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar(
                     "charts/SPS",
@@ -340,6 +447,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 )
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
+            if global_step > 1e4 and global_step % args.save_frequency == 0:
+                save_checkpoint(args, global_step, actor, qf1, qf2, qf1_target, qf2_target, run_name)
 
     envs.close()
     writer.close()
